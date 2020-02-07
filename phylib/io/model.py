@@ -20,7 +20,9 @@ import scipy.io as sio
 from tqdm import tqdm
 
 from .array import _index_of, _spikes_in_clusters
-from .traces import _extract_waveform, get_ephys_traces, random_ephys_traces, extract_waveforms
+from .traces import (
+    _extract_waveform, get_ephys_traces, random_ephys_traces, extract_waveforms,
+    from_dask)
 from phylib.utils import Bunch
 from phylib.utils._misc import _write_tsv_simple, _read_tsv_simple, read_python
 from phylib.utils.geometry import linear_positions
@@ -475,7 +477,8 @@ class TemplateModel(object):
             paths, n_channels_dat=n, dtype=self.dtype, offset=self.offset,
             sample_rate=self.sample_rate)
         if traces is not None:
-            traces = traces[:, channel_map]  # lazy permutation on the channel axis using dask
+            # lazy permutation on the channel axis using dask
+            traces = from_dask(traces[:, channel_map], reader=traces.reader)
         return traces
 
     def _load_amplitudes(self):

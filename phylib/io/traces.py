@@ -50,20 +50,48 @@ def _extract_waveform(traces, sample, channel_ids=None, n_samples_waveforms=None
     return w
 
 
+# def _get_sample_indices(sample, nsw):
+#     a = nsw // 2
+#     b = nsw - a
+#     return list(range(int(sample - a), int(sample + b)))
+
+
 def extract_waveforms(traces, spike_samples, channel_ids, n_samples_waveforms=None):
     """Extract waveforms for a given set of spikes, on certain channels."""
     # Create the output array.
+    spike_samples = np.asarray(spike_samples, dtype=np.int64)
     ns = len(spike_samples)
     nsw = n_samples_waveforms
     assert nsw > 0, "Please specify n_samples_waveforms > 0"
     nc = len(channel_ids)
-    out = np.zeros((ns, nsw, nc), dtype=np.float64)
-    # Extract the spike waveforms.
-    out = da.concatenate((_extract_waveform(
-        traces, ts, channel_ids=channel_ids, n_samples_waveforms=nsw)[np.newaxis, ...]
-        for i, ts in enumerate(spike_samples)), axis=0)
-    out -= da.median(out, axis=1)[:, np.newaxis, :]
-    return out.compute()
+    # out = np.zeros((ns, nsw, nc), dtype=np.float64)
+
+    # assert isinstance(traces, da.Array)
+    # traces = traces[:, channel_ids]
+    # traces = da.pad(traces, ((nsw, nsw), (0, 0)), 'constant')
+    # spike_samples += nsw
+
+    a = nsw // 2
+    b = nsw - a
+    si = np.repeat(spike_samples, nsw)
+    si = si + np.tile(np.arange(-a, +b), ns)
+    tr = traces[si, :][:, channel_ids]#.compute()
+    return tr.reshape((ns, nsw, nc))
+
+    # # Extract the spike waveforms.
+    # t = traces[:, channel_ids]
+    # ws = [
+    #     _extract_waveform(t, ts, n_samples_waveforms=nsw)
+    #     for i, ts in enumerate(spike_samples)]
+    # out = da.stack(ws, axis=0)
+    # out -= da.median(out, axis=1)[:, np.newaxis, :]
+    # return out.compute()
+
+    # out = da.concatenate((
+    #     _extract_waveform(t, ts, n_samples_waveforms=nsw)[np.newaxis, ...]
+    #     for i, ts in enumerate(spike_samples)), axis=0)
+    # out -= da.median(out, axis=1)[:, np.newaxis, :]
+    # return out.compute()
 
 
 #------------------------------------------------------------------------------
@@ -140,9 +168,9 @@ class EphysTraces(da.Array):
         i0, i1 = int(round(t0 * self.sample_rate)), int(round(t1 * self.sample_rate))
         return from_dask(self[i0:i1, :], reader=self.reader)
 
-    def __getitem__(self, item):
-        out = super(EphysTraces, self).__getitem__(item)
-        return from_dask(out, reader=self.reader)
+    # def __getitem__(self, item):
+    #     out = super(EphysTraces, self).__getitem__(item)
+    #     return from_dask(out, reader=self.reader)
 
 
 #------------------------------------------------------------------------------
@@ -160,6 +188,9 @@ class BaseEphysReader(object):
 
     def get_traces(self):
         raise NotImplementedError()
+
+    def _from_array(self, arr):
+        return from_dask(da.from_array(arr, arr.shape, name='traces'), reader=self)
 
 
 class ChunkEphysReader(BaseEphysReader):
@@ -188,33 +219,29 @@ class ChunkEphysReader(BaseEphysReader):
             dask, name, chunks, dtype=self.dtype, shape=shape, reader=self)
 
 
-class FlatEphysReader(ChunkEphysReader):
+class FlatEphysReader(BaseEphysReader):
     format = 'flat'
 
     def __init__(self, path, n_channels=None, dtype=None, offset=None, sample_rate=None):
         self.path = Path(path)
         self.n_channels = n_channels
-        self.dtype = np.dtype(self.dtype if self.dtype is not None else np.int16)
+        self.dtype = np.dtype(dtype if dtype is not None else np.int16)
         self.offset = offset or 0
         self.sample_rate = sample_rate
         assert self.sample_rate > 0
         # Find the number of samples.
         assert self.n_channels > 0
-        fsize = path.stat().st_size
-        item_size = np.dtype(dtype).itemsize
+
+    def get_traces(self):
+        fsize = self.path.stat().st_size
+        item_size = self.dtype.itemsize
         n_samples = (fsize - self.offset) // (item_size * self.n_channels)
-        self._set_chunk_bounds(n_samples)
-
-    def _load_chunk(self, chunk_idx):
-        i0, i1 = self.chunk_bounds[chunk_idx:chunk_idx + 2]
-        count = (i1 - i0) * self.n_channels
-        item_size = np.dtype(self.dtype).itemsize
-        offset = i0 * self.n_channels * item_size
-        shape = (i1 - i0, self.n_channels)
-        return np.fromfile(self.path, dtype=self.dtype, count=count, offset=offset).reshape(shape)
+        shape = (n_samples, self.n_channels)
+        arr = np.memmap(self.path, dtype=self.dtype, offset=self.offset, shape=shape)
+        return self._from_array(arr)
 
 
-class NpyEphysReader(ChunkEphysReader):
+class NpyEphysReader(BaseEphysReader):
     format = 'npy'
 
     def __init__(self, path, sample_rate=None):
@@ -223,11 +250,10 @@ class NpyEphysReader(ChunkEphysReader):
         self._arr = np.load(str(self.path), mmap_mode='r')
         self.n_channels = self._arr.shape[1]
         self.dtype = np.dtype(self._arr.dtype)
-        self._set_chunk_bounds(self._arr.shape[0])
 
-    def _load_chunk(self, chunk_idx):
-        i0, i1 = self.chunk_bounds[chunk_idx:chunk_idx + 2]
-        return self._arr[i0:i1, :]
+    def get_traces(self):
+        arr = np.load(self.path, mmap_mode='r')
+        return self._from_array(arr)
 
 
 class MtscompEphysReader(ChunkEphysReader):
@@ -254,7 +280,7 @@ class ArrayEphysReader(BaseEphysReader):
     def get_traces(self):
         arr = self.arr
         n_samples, n_channels = arr.shape
-        chunk_shape = (int(self.sample_rate or n_samples), n_channels)  # 1 second chunk
+        chunk_shape = (n_samples, n_channels)  # 1 chunk
         dask_arr = da.from_array(arr, chunk_shape, name='traces')
         return from_dask(dask_arr, reader=self)
 
